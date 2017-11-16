@@ -3,6 +3,7 @@ from flask import Flask, jsonify, g
 from flask_sqlalchemy import SQLAlchemy
 
 from order.app.auth import auth
+from order.app.decorators.json import json
 
 db = SQLAlchemy()
 
@@ -26,7 +27,8 @@ def create_app(config_name):
 
     @app.route('/get-auth-token')
     @auth.login_required
+    @json
     def get_auth_token():
-        return jsonify({'token': g.user.generate_auth_token()})
+        return {'token': g.user.generate_auth_token()}
 
     return app

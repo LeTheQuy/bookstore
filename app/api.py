@@ -1,12 +1,13 @@
 import os
 from datetime import datetime
-
+from flask import Flask, url_for, jsonify, request, g, Blueprint, current_app
 from flask_httpauth import HTTPBasicAuth
 from flask_sqlalchemy import SQLAlchemy
-from flask import Flask, url_for, jsonify, request, Blueprint, current_app
+from flask.globals import _app_ctx_stack, _request_ctx_stack
 from itsdangerous import TimedJSONWebSignatureSerializer as Serializer
 from werkzeug.security import generate_password_hash, check_password_hash
-
+from werkzeug.urls import url_parse
+from werkzeug.exceptions import NotFound
 
 basedir = os.path.abspath(os.path.dirname(__file__))
 db_path = os.path.join(basedir, '../data.sqlite')
@@ -14,19 +15,20 @@ db_path = os.path.join(basedir, '../data.sqlite')
 app = Flask(__name__)
 api = Blueprint('api', __name__)
 app.config['SECRET_KEY'] = 'top-secret!'
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + db_path
-
-auth_token = HTTPBasicAuth()
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL') or \
+                                        'sqlite:///' + db_path
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = 'true'
 
 db = SQLAlchemy(app)
 auth = HTTPBasicAuth()
+auth_token = HTTPBasicAuth()
 
 
 class ValidationError(ValueError):
     pass
 
 
-@api.errorhandler(ValidationError)
+@app.errorhandler(ValidationError)
 def bad_request(e):
     response = jsonify({'status': 400, 'error': 'bad request',
                         'message': e.args[0]})
@@ -34,7 +36,7 @@ def bad_request(e):
     return response
 
 
-@api.errorhandler(404)
+@app.errorhandler(404)
 def not_found(e):
     response = jsonify({'status': 404, 'error': 'not found',
                         'message': 'invalid resource URI'})
@@ -42,7 +44,7 @@ def not_found(e):
     return response
 
 
-@api.errorhandler(405)
+@app.errorhandler(405)
 def method_not_supported(e):
     response = jsonify({'status': 405, 'error': 'method not supported',
                         'message': 'the method is not supported'})
@@ -50,7 +52,7 @@ def method_not_supported(e):
     return response
 
 
-@api.errorhandler(500)
+@app.errorhandler(500)
 def internal_server_error(e):
     response = jsonify({'status': 500, 'error': 'internal server error',
                         'message': e.args[0]})
@@ -91,13 +93,13 @@ class Customer(db.Model):
     orders = db.relationship('Order', backref='customer', lazy='dynamic')
 
     def get_url(self):
-        return url_for('get_customer', id=self.id, _external=True)
+        return url_for('api.get_customer', id=self.id, _external=True)
 
     def export_data(self):
         return {
             'self_url': self.get_url(),
             'name': self.name,
-            'orders_url': url_for('get_customer_orders', id=self.id,
+            'orders_url': url_for('api.get_customer_orders', id=self.id,
                                   _external=True)
         }
 
@@ -116,7 +118,7 @@ class Product(db.Model):
     items = db.relationship('Item', backref='product', lazy='dynamic')
 
     def get_url(self):
-        return url_for('get_product', id=self.id, _external=True)
+        return url_for('api.get_product', id=self.id, _external=True)
 
     def export_data(self):
         return {
@@ -142,21 +144,20 @@ class Order(db.Model):
                             cascade='all, delete-orphan')
 
     def get_url(self):
-        return url_for('get_order', id=self.id, _external=True)
+        return url_for('api.get_order', id=self.id, _external=True)
 
     def export_data(self):
         return {
             'self_url': self.get_url(),
             'customer_url': self.customer.get_url(),
             'date': self.date.isoformat() + 'Z',
-            'items_url': url_for('get_order_items', id=self.id,
+            'items_url': url_for('api.get_order_items', id=self.id,
                                  _external=True)
         }
 
     def import_data(self, data):
         try:
             self.date = data['date']
-            # todo
         except KeyError as e:
             raise ValidationError('Invalid order: missing ' + e.args[0])
         return self
@@ -171,7 +172,7 @@ class Item(db.Model):
     quantity = db.Column(db.Integer)
 
     def get_url(self):
-        return url_for('get_item', id=self.id, _external=True)
+        return url_for('api.get_item', id=self.id, _external=True)
 
     def export_data(self):
         return {
@@ -183,23 +184,21 @@ class Item(db.Model):
 
     def import_data(self, data):
         try:
-            endpoint, args = 'get_product', 'id'
+            endpoint, args = split_url(data['product_url'])
             self.quantity = int(data['quantity'])
         except KeyError as e:
             raise ValidationError('Invalid order: missing ' + e.args[0])
-        if endpoint != 'get_product' or not 'id' in args:
+        if endpoint != 'api.get_product' or not 'id' in args:
             raise ValidationError('Invalid product URL: ' +
                                   data['product_url'])
-
         self.product = Product.query.get(args['id'])
-
         if self.product is None:
             raise ValidationError('Invalid product URL: ' +
                                   data['product_url'])
         return self
 
 
-@auth_token.verify_password
+@auth.verify_password
 def verify_password(username, password):
     g.user = User.query.filter_by(username=username).first()
     if g.user is None:
@@ -213,7 +212,13 @@ def verify_auth_token(token, unused):
     return g.user is not None
 
 
-@auth_token.error_handler
+@api.before_request
+@auth_token.login_required
+def before_request():
+    pass
+
+
+@auth.error_handler
 def unauthorized():
     response = jsonify({'status': 401, 'error': 'unauthorized',
                         'message': 'please authenticate'})
@@ -221,13 +226,15 @@ def unauthorized():
     return response
 
 
-@api.before_request
-@auth_token.login_required
-def before_request():
-    pass
+@auth_token.error_handler
+def unauthorized_token():
+    response = jsonify({'status': 401, 'error': 'unauthorized',
+                        'message': 'please send your authentication token'})
+    response.status_code = 401
+    return response
 
 
-@api.route('/get-auth-token')
+@app.route('/get-auth-token')
 @auth.login_required
 def get_auth_token():
     return jsonify({'token': g.user.generate_auth_token()})
@@ -365,19 +372,48 @@ def edit_item(id):
     return jsonify({})
 
 
-@api.route('/items/<int:id>', methods=['DELETE'])
-def delete_item(id):
-    item = Item.query.get_or_404(id)
-    db.session.delete(item)
-    db.session.commit()
-    return jsonify({})
+@api.route("/")
+def hello():
+    return 'Wellcome to Order Api '
 
+
+def split_url(url, method='GET'):
+    """Returns the endpoint name and arguments that match a given URL. In
+    other words, this is the reverse of Flask's url_for()."""
+    appctx = _app_ctx_stack.top
+    reqctx = _request_ctx_stack.top
+    if appctx is None:
+        raise RuntimeError('Attempted to match a URL without the '
+                           'application context being pushed. This has to be '
+                           'executed when application context is available.')
+
+    if reqctx is not None:
+        url_adapter = reqctx.url_adapter
+    else:
+        url_adapter = appctx.url_adapter
+        if url_adapter is None:
+            raise RuntimeError('Application was not able to create a URL '
+                               'adapter for request independent URL matching. '
+                               'You might be able to fix this by setting '
+                               'the SERVER_NAME config variable.')
+    parsed_url = url_parse(url)
+    if parsed_url.netloc is not '' and \
+                    parsed_url.netloc != url_adapter.server_name:
+        raise ValidationError('Invalid URL: ' + url)
+    try:
+        result = url_adapter.match(parsed_url.path, method)
+    except NotFound:
+        raise ValidationError('Invalid URL: ' + url)
+    return result
+
+
+app.register_blueprint(api)
 
 if __name__ == '__main__':
     db.create_all()
-    # if User.query.get(1) is None:
-    #     u = User(username='quy')
-    #     u.set_password('dz')
-    #     db.session.add(u)
-    #     db.session.commit()
-    app.run(debug=True)
+    if User.query.get(1) is None:
+        u = User(username='john')
+        u.set_password('cat')
+        db.session.add(u)
+        db.session.commit()
+    app.run(debug=False)
